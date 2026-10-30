@@ -31,7 +31,6 @@ import argparse
 import json
 import re
 import sqlite3
-import sys
 import time
 import urllib.parse
 import urllib.request
@@ -286,6 +285,47 @@ def build_row(title: str, wikitext: str) -> dict | None:
 # --------------------------------------------------------------------------- #
 # DB
 # --------------------------------------------------------------------------- #
+# Same DDL as build_2e_db.build_items. Kept here so the importer can stand up a
+# fresh checkout's 2e.db on its own — build_2e_db no longer reaches its upstream.
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS items (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL COLLATE NOCASE,
+    item_type   TEXT,
+    cost        TEXT,
+    weight      TEXT,
+    description TEXT,
+    source      TEXT,
+    rarity      INTEGER DEFAULT 0,
+    ac          INTEGER,
+    size        TEXT,
+    weapon_type TEXT,
+    speed       INTEGER,
+    damage_sm   TEXT,
+    damage_l    TEXT,
+    rof         TEXT,
+    range_s     TEXT,
+    range_m     TEXT,
+    range_l     TEXT,
+    xp_value    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_items_name ON items(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_items_type ON items(item_type);
+"""
+
+
+def ensure_schema(conn: sqlite3.Connection) -> bool:
+    """Create the items table when absent. True when it was created."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'"
+    ).fetchone() is not None
+    if exists:
+        return False
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    return True
+
+
 def existing_names(conn: sqlite3.Connection) -> set[str]:
     return {r[0].strip().lower()
             for r in conn.execute("SELECT name FROM items WHERE name IS NOT NULL")}
@@ -322,12 +362,15 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     db_path = Path(args.db)
-    if not db_path.exists():
-        print(f"error: db not found: {db_path}", file=sys.stderr)
-        return 2
-
-    conn = sqlite3.connect(str(db_path))
+    if not args.dry_run:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.dry_run and not db_path.exists():
+        conn = sqlite3.connect(":memory:")   # a dry run writes nothing to disk
+    else:
+        conn = sqlite3.connect(str(db_path))
     try:
+        if ensure_schema(conn) and not args.dry_run:
+            print(f"Initialised items schema in {db_path}.")
         have = existing_names(conn)
         nid = next_id(conn)
         print(f"DB: {db_path} — {len(have)} items already recorded; "

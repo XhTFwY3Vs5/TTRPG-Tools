@@ -8,9 +8,10 @@ creature it also downloads the wiki infobox image (if present) into
 ``global/monsters/<slug>.<ext>`` — the filename convention the dashboard's
 ``/monsters/portraits/<filename>`` route already discovers.
 
-monsters.db has no builder script (it's hand-maintained), so direct inserts are
-safe. Scraped rows get ids from a dedicated high range (>= _ID_BASE) and a
-source footer in the description, so they're easy to spot or re-import.
+Upstream ships no builder for monsters.db, so this module also owns the schema:
+when the DB (or its table) is missing it creates them before importing. Scraped
+rows get ids from a dedicated high range (>= _ID_BASE) and a source footer in
+the description, so they're easy to spot or re-import.
 
 Usage:
     python3 tools/import_wiki_monsters.py [--dry-run] [--limit N]
@@ -298,17 +299,42 @@ def _parse_thac0(v: str):
     return int(m.group(0)) if m else None
 
 
-def build_row(title: str, wikitext: str) -> dict | None:
-    """Map a wiki page to a monsters-row dict (+ '_image' filename), or None to
-    skip (redirect / not a creature infobox / no content)."""
-    if re.match(r"\s*#redirect", wikitext, re.IGNORECASE):
-        return None
-    inner, end = _find_template(wikitext, "Creature")
-    if inner is None:
-        return None
-    fields = parse_infobox(inner)
+def _variant_suffixes(fields: dict[str, str]) -> list[str]:
+    """Field suffixes for one {{Creature}} block.
 
-    name = (clean_markup(fields.get("name", "")) or title).strip().lower()
+    Pages describing a single creature use bare keys ('armorclass'), but a page
+    covering several variants numbers them — 'armorclass1'..'armorclass8', each
+    with its own 'nameN'. Reading only bare keys is why the Monstrous Manual's
+    multi-entry pages (orc, troll, kobold, ...) used to import with no stats.
+    Returns [''] for a single-entry page so callers need no special case.
+    """
+    numbered: set[int] = set()
+    has_bare = False
+    for key in fields:
+        m = re.fullmatch(r"(.+?)(\d+)", key)
+        if m and m.group(1) in _FIELD_MAP:
+            numbered.add(int(m.group(2)))
+        elif key in _FIELD_MAP:
+            has_bare = True
+    suffixes = [str(n) for n in sorted(numbered)]
+    if has_bare:
+        suffixes.insert(0, "")
+    return suffixes or [""]
+
+
+def _row_from(fields: dict[str, str], suffix: str, title: str, wikitext: str,
+              end: int) -> dict | None:
+    """One monsters-row for a single variant (suffix '') or numbered variant."""
+
+    def field(key: str) -> str:
+        """Variant value, falling back to the unnumbered key."""
+        if suffix:
+            val = fields.get(f"{key}{suffix}")
+            if val is not None:
+                return val
+        return fields.get(key, "")
+
+    name = (clean_markup(field("name")) or title).strip().lower()
     if not name:
         return None
     # Skip overview/index pages ("X, general information") — not real stat blocks.
@@ -318,28 +344,268 @@ def build_row(title: str, wikitext: str) -> dict | None:
 
     row = {c: None for c in _ALL_COLUMNS}
     for wiki_key, col in _FIELD_MAP.items():
-        if wiki_key in fields:
-            val = clean_markup(fields[wiki_key])
-            row[col] = _parse_thac0(val) if col == "thac0" else (val or None)
+        val = clean_markup(field(wiki_key))
+        if val:
+            row[col] = _parse_thac0(val) if col == "thac0" else val
 
     raw_body = clean_markup(wikitext[end:] if end else wikitext)
     body, categories, _ = split_metadata(raw_body)
-    src = clean_markup(fields.get("source", ""))
+    src = clean_markup(field("source"))
     row["description"] = body or None
     row["categories"] = json.dumps(categories) if categories else None
     row["source"] = f"{src} ({_SOURCE_TAG})" if src else _SOURCE_TAG
     row["name"] = name
 
-    img = fields.get("image", "").strip()
+    img = field("image").strip()
     img = re.sub(r"\[\[(?:File|Image):", "", img, flags=re.IGNORECASE).strip("[]| ")
     img = img.split("|")[0].strip() if img else ""
     row["_image"] = img or None
     return row
 
 
+# Stat fields as they appear in the transposed body tables ("Armor Class:" /
+# "Hit Dice:" as rows, variants as columns). That is the wiki's older layout,
+# used on pages whose {{Creature}} infobox is a bare stub — Zombie and
+# Skeleton, for instance, carry every stat only in a table like this.
+_BODY_STAT_FIELDS = {
+    "armor class": "armor_class",
+    "hit dice": "hit_dice",
+    "thac0": "thac0",
+    "no. of attacks": "no_of_attacks",
+    "damage/attack": "damage_attack",
+    "special attacks": "special_attacks",
+    "special defenses": "special_defenses",
+    "magic resistance": "magic_resistance",
+    "intelligence": "intelligence",
+    "alignment": "alignment",
+    "size": "size",
+    "morale": "morale",
+    "xp value": "xp_value",
+    "frequency": "frequency",
+    "no. appearing": "no_appearing",
+    "climate/terrain": "climate_terrain",
+    "movement": "move",
+    "treasure": "treasure_type",
+    "pct. in lair": "pct_in_lair",
+    "% in lair": "pct_in_lair",
+    "psionic ability": "psionic_ability",
+    "attack/defense modes": "attack_defense_modes",
+}
+
+# Column names that mean "the creature this page is about", rather than a
+# named variant of it.
+_DEFAULT_VARIANT_NAMES = ("", "common", "standard", "normal", "typical")
+
+
+def _split_wiki_cells(line: str) -> list[str]:
+    """Split a table row's cell text on || / !! outside links and templates."""
+    parts, links, braces, buf, i = [], 0, 0, [], 0
+    while i < len(line):
+        two = line[i:i + 2]
+        if two == "[[":
+            links += 1; buf.append(two); i += 2; continue
+        if two == "]]":
+            links = max(0, links - 1); buf.append(two); i += 2; continue
+        if two == "{{":
+            braces += 1; buf.append(two); i += 2; continue
+        if two == "}}":
+            braces = max(0, braces - 1); buf.append(two); i += 2; continue
+        if two in ("||", "!!") and links == 0 and braces == 0:
+            parts.append("".join(buf)); buf = []; i += 2; continue
+        buf.append(line[i]); i += 1
+    parts.append("".join(buf))
+    return [p.strip() for p in parts]
+
+
+def _strip_cell_attributes(cell: str) -> str:
+    if "|" not in cell:
+        return cell
+    if not re.match(r"^\s*(?:style|colspan|rowspan|class|align|width|scope)\s*=",
+                    cell, re.IGNORECASE):
+        return cell
+    links = braces = 0
+    for i, ch in enumerate(cell):
+        nxt = cell[i:i + 2]
+        if nxt == "[[":
+            links += 1
+        elif nxt == "]]":
+            links = max(0, links - 1)
+        elif nxt == "{{":
+            braces += 1
+        elif nxt == "}}":
+            braces = max(0, braces - 1)
+        elif ch == "|" and links == 0 and braces == 0:
+            return cell[i + 1:].strip()
+    return cell
+
+
+def parse_tables(wikitext: str) -> list[list[list[str]]]:
+    """Every wikitable as rows of cleaned cells. Row breaks are '|-' only."""
+    tables: list[list[list[str]]] = []
+    rows: list[list[str]] | None = None
+    cur: list[str] = []
+
+    def flush():
+        if any(c for c in cur):
+            rows.append(list(cur))
+        cur.clear()
+
+    for raw in wikitext.splitlines():
+        line = raw.strip()
+        if line.startswith("{|"):
+            rows, cur = [], []
+        elif rows is None:
+            continue
+        elif line.startswith("|}"):
+            flush()
+            tables.append(rows)
+            rows, cur = None, []
+        elif line.startswith("|-"):
+            flush()
+        elif line.startswith("|+"):
+            continue
+        elif line.startswith("!") or line.startswith("|"):
+            for cell in _split_wiki_cells(line[1:]):
+                cur.append(clean_markup(_strip_cell_attributes(cell)))
+    return tables
+
+
+def _body_stat_rows(wikitext: str, end: int, title: str,
+                    source: str) -> list[dict]:
+    """Rows from a transposed stat table in the page body (see above)."""
+    body = wikitext[end:] if end else wikitext
+    for rows in parse_tables(body):
+        labelled = []
+        for row in rows:
+            if row:
+                label = row[0].strip().rstrip(":").strip().lower()
+                if label in _BODY_STAT_FIELDS:
+                    labelled.append((_BODY_STAT_FIELDS[label], row))
+        if not labelled:
+            continue
+        n_cols = max(len(r) - 1 for _, r in labelled)
+        if n_cols < 1:
+            continue
+
+        names = [""] * n_cols
+        if rows and rows[0] and not rows[0][0].strip():
+            for i, head in enumerate(rows[0][1:n_cols + 1]):
+                names[i] = head
+
+        out = []
+        for i in range(n_cols):
+            row = {c: None for c in _ALL_COLUMNS}
+            for col, cells in labelled:
+                if i + 1 < len(cells):
+                    val = cells[i + 1].strip()
+                    if val and val not in ("—", "–"):
+                        row[col] = _parse_thac0(val) if col == "thac0" else val
+            if not (row["armor_class"] or row["hit_dice"]):
+                continue
+            variant = clean_markup(names[i]).strip()
+            name = title.lower() if variant.strip().lower() in _DEFAULT_VARIANT_NAMES \
+                else f"{title.lower()}, {variant.lower()}"
+            row["name"] = name
+            row["source"] = f"{source} ({_SOURCE_TAG})" if source else _SOURCE_TAG
+            out.append(row)
+        if out:
+            return out
+    return []
+
+
+def _source_rank(source: str) -> int:
+    """Lower is better. Two pages can describe a creature under the same name —
+    the core bestiary should win that race, not whichever page was fetched
+    first (a Ravenloft 'Zombie' or a Mystara 'Troll' otherwise shadows the
+    Monstrous Manual entry)."""
+    s = (source or "").lower()
+    if "monstrous manual" in s:
+        return 0
+    if "monstrous compendium" in s:
+        return 2 if "annual" in s else 1
+    return 3
+
+
+def build_rows(title: str, wikitext: str) -> list[dict]:
+    """Map a wiki page to monsters-row dicts (+ '_image' filenames).
+
+    One row per creature the page describes. Empty when the page is a redirect
+    or carries no {{Creature}} infobox.
+    """
+    if re.match(r"\s*#redirect", wikitext, re.IGNORECASE):
+        return []
+    inner, end = _find_template(wikitext, "Creature")
+    if inner is None:
+        return []
+    fields = parse_infobox(inner)
+    rows = []
+    for suffix in _variant_suffixes(fields):
+        row = _row_from(fields, suffix, title, wikitext, end)
+        if row:
+            rows.append(row)
+    if not any(r["armor_class"] or r["hit_dice"] for r in rows):
+        body_rows = _body_stat_rows(wikitext, end, title,
+                                    clean_markup(fields.get("source", "")))
+        if body_rows:
+            return body_rows
+    return rows
+
+
 # --------------------------------------------------------------------------- #
 # DB
 # --------------------------------------------------------------------------- #
+# The canonical monsters schema. Column names are the contract: lookup.py,
+# combat.py, build_encounter_tables.py and dashboard_monsters.py all read these
+# names, and _ALL_COLUMNS above is the same list in insert order.
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS monsters (
+    id                    INTEGER PRIMARY KEY,
+    name                  TEXT,
+    frequency             TEXT,
+    no_appearing          TEXT,
+    armor_class           TEXT,
+    move                  TEXT,
+    hit_dice              TEXT,
+    thac0                 INTEGER,
+    pct_in_lair           TEXT,
+    treasure_type         TEXT,
+    no_of_attacks         TEXT,
+    damage_attack         TEXT,
+    special_attacks       TEXT,
+    special_defenses      TEXT,
+    magic_resistance      TEXT,
+    intelligence          TEXT,
+    alignment             TEXT,
+    size                  TEXT,
+    psionic_ability       TEXT,
+    attack_defense_modes  TEXT,
+    description           TEXT,
+    climate_terrain       TEXT,
+    morale                TEXT,
+    xp_value              TEXT,
+    categories            TEXT,
+    source                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_monsters_name ON monsters(name COLLATE NOCASE);
+"""
+
+
+def table_exists(conn, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+
+def ensure_schema(conn) -> bool:
+    """Create the monsters table when it is absent. True when it was created."""
+    if table_exists(conn, "monsters"):
+        return False
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    return True
+
+
 def existing_names(conn) -> set[str]:
     return {r[0].strip().lower()
             for r in conn.execute("SELECT name FROM monsters WHERE name IS NOT NULL")}
@@ -372,14 +638,19 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     db_path, img_dir = Path(args.db), Path(args.img_dir)
-    if not db_path.exists():
-        print(f"error: monsters db not found: {db_path}", file=sys.stderr)
-        return 2
+    if not args.dry_run:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.dry_run and not db_path.exists():
+        conn = sqlite3.connect(":memory:")   # a dry run writes nothing to disk
+    else:
+        conn = sqlite3.connect(str(db_path))
     if not args.dry_run and not args.no_images:
         img_dir.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path))
     try:
+        if ensure_schema(conn) and not args.dry_run:
+            print(f"Initialised monsters schema in {db_path} (no builder ships "
+                  f"upstream; columns taken from this module and its readers).")
         have = existing_names(conn)
         nid = next_id(conn)
         print(f"DB: {db_path} — {len(have)} creatures recorded; new ids from {nid}.")
@@ -397,25 +668,35 @@ def main(argv: list[str] | None = None) -> int:
                   end="\r", flush=True)
         print()
 
-        # Build rows for creatures not already recorded.
-        new_rows: list[dict] = []
-        seen: set[str] = set()
+        # Build rows for creatures not already recorded. Rows are keyed by name:
+        # the same creature appears on several pages (the Monstrous Manual
+        # entry, a Ravenloft variant, a Mystara variant), and the best-sourced
+        # one wins rather than whichever page happened to be fetched first.
+        candidates: dict[str, dict] = {}
         skipped_existing = skipped_nodata = 0
         for title in titles:
             wt = wikitexts.get(title)
-            row = build_row(title, wt) if wt else None
-            if row is None:
+            rows = build_rows(title, wt) if wt else []
+            if not rows:
                 skipped_nodata += 1
                 continue
-            key = row["name"]
-            if key in have or key in seen:
-                skipped_existing += 1
-                continue
-            seen.add(key)
-            new_rows.append(row)
+            for row in rows:
+                key = row["name"]
+                if key in have:
+                    skipped_existing += 1
+                    continue
+                prev = candidates.get(key)
+                if prev is None:
+                    candidates[key] = row
+                else:
+                    skipped_existing += 1
+                    if _source_rank(row["source"]) < _source_rank(prev["source"]):
+                        candidates[key] = row
+        new_rows = list(candidates.values())
 
         print(f"{len(new_rows)} new creatures (skipped {skipped_existing} "
-              f"already-recorded, {skipped_nodata} redirects/non-creature).")
+              f"already-recorded/duplicate, {skipped_nodata} pages with no "
+              f"stat block).")
 
         # Resolve image URLs in bulk.
         url_map: dict[str, str] = {}

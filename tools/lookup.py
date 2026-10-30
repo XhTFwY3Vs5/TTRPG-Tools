@@ -61,9 +61,14 @@ def register(mcp):
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.cursor()
+            # Prefer an exact name, then the shortest substring match: "goblin"
+            # must resolve to the goblin, not to "goblin (cerilia)", and "orc"
+            # must beat "orc, neo-orog". Without an ORDER BY the winner was
+            # whichever row happened to be inserted first.
             cur.execute(
-                "SELECT * FROM monsters WHERE name LIKE ? COLLATE NOCASE",
-                (f"%{name}%",),
+                "SELECT * FROM monsters WHERE name LIKE ? COLLATE NOCASE "
+                "ORDER BY (name = ? COLLATE NOCASE) DESC, length(name) LIMIT 1",
+                (f"%{name}%", name),
             )
             row = cur.fetchone()
             if row is None:
@@ -114,15 +119,21 @@ def register(mcp):
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         try:
+            # Prefer an exact name, then the shortest substring match: the DB
+            # carries thousands of variants ("Delayed Magic Missile"), and with
+            # no ORDER BY the winner was whichever row was inserted first.
+            order = "(name = ? COLLATE NOCASE) DESC, length(name)"
             if caster:
                 cur = conn.execute(
-                    "SELECT * FROM spells WHERE name LIKE ? COLLATE NOCASE AND caster LIKE ? COLLATE NOCASE LIMIT 1",
-                    (f"%{name}%", f"%{caster}%"),
+                    f"SELECT * FROM spells WHERE name LIKE ? COLLATE NOCASE "
+                    f"AND caster LIKE ? COLLATE NOCASE ORDER BY {order} LIMIT 1",
+                    (f"%{name}%", f"%{caster}%", name),
                 )
             else:
                 cur = conn.execute(
-                    "SELECT * FROM spells WHERE name LIKE ? COLLATE NOCASE LIMIT 1",
-                    (f"%{name}%",),
+                    f"SELECT * FROM spells WHERE name LIKE ? COLLATE NOCASE "
+                    f"ORDER BY {order} LIMIT 1",
+                    (f"%{name}%", name),
                 )
             row = cur.fetchone()
             if row is None:
