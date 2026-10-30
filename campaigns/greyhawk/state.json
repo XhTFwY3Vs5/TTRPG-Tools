@@ -1,0 +1,15 @@
+{
+  "current_day": 1,
+  "current_hour": 6,
+  "current_minute": 0,
+  "current_session": 1,
+  "coin": {
+    "pp": 0,
+    "gp": 0,
+    "ep": 0,
+    "sp": 0,
+    "cp": 0
+  },
+  "characters": {},
+  "combat": null
+}

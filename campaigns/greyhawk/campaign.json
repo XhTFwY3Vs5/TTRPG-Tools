@@ -1,0 +1,46 @@
+{
+  "name": "Greyhawk",
+  "system": "AD&D 2nd Edition",
+  "world": "Greyhawk",
+  "tone": "classic 2nd-edition sword & sorcery",
+  "data_dir": ".",
+  "default_character": "",
+  "session_log_file": "adventure_log.md",
+  "chronicle_file": "adventure_log.md",
+  "initial_coin": {
+    "pp": 0,
+    "gp": 0,
+    "ep": 0,
+    "sp": 0,
+    "cp": 0
+  },
+  "characters": {},
+  "encounter_tables": {
+    "dungeon_l1": [],
+    "road": [],
+    "wilderness": [],
+    "urban": []
+  },
+  "encounter_frequency": {
+    "dungeon": {
+      "die": 6,
+      "threshold": 1,
+      "interval_minutes": 10
+    },
+    "wilderness": {
+      "die": 6,
+      "threshold": 1,
+      "interval_minutes": 240
+    },
+    "road": {
+      "die": 6,
+      "threshold": 1,
+      "interval_minutes": 60
+    },
+    "urban": {
+      "die": 20,
+      "threshold": 1,
+      "interval_minutes": 120
+    }
+  }
+}
